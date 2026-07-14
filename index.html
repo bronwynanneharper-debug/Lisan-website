@@ -1,1 +1,932 @@
+<!DOCTYPE html>
 
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lisān · Arabic Drills</title>
+<link rel="icon" href="data:," />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ============================================================
+// CONFIG — replace these before sharing the link with your class
+// ============================================================
+
+// From Supabase: Project Settings -> API -> Project URL / anon public key
+const SUPABASE_URL = 'https://xgfpnlzbtgiyeruggjxl.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_FFlXAiV2CJg5oyW3xfIx4A_T00cWK5O';
+
+// Passwords are checked in the browser, not on a server — fine for keeping
+// casual visitors out, but not a real security boundary. Don't reuse a
+// password you use elsewhere.
+const CLASS_PASSWORD = 'CENTCOM1710';
+const ADMIN_PASSWORD = '1710';
+
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ============================================================
+// Constants
+// ============================================================
+
+const PARTS_OF_SPEECH = ['Noun', 'Verb', 'Adjective', 'Adverb', 'Pronoun', 'Preposition', 'Conjunction', 'Number', 'Phrase/Expression', 'Interjection'];
+const UNCATEGORIZED = 'Uncategorized';
+function unitLabel(u) { return u && u.trim() ? u.trim() : UNCATEGORIZED; }
+function posLabel(p) { return p && p.trim() ? p.trim() : UNCATEGORIZED; }
+
+// ============================================================
+// Helpers
+// ============================================================
+
+function uid() { return Math.random().toString(36).slice(2, 10); }
+
+function stripTag(str) {
+  return (str || '').replace(/\s*\[[^\]]*\]\s*/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeArabic(str, lenient) {
+  if (!str) return '';
+  let s = str.normalize('NFC').trim().replace(/[\u064B-\u0652\u0670\u0640\s]/g, '');
+  if (lenient) {
+    s = s.replace(/[إأآا]/g, 'ا').replace(/ى/g, 'ي').replace(/ؤ/g, 'و').replace(/ئ/g, 'ي');
+  }
+  return s;
+}
+
+function normalizeEnglish(str) { return str.trim().toLowerCase().replace(/[.,!?]/g, ''); }
+
+function checkEnglishAnswer(userInput, storedEnglish) {
+  const options = stripTag(storedEnglish).split('/').map(normalizeEnglish).filter(Boolean);
+  return options.includes(normalizeEnglish(userInput));
+}
+
+function checkArabicAnswer(userInput, correct, lenient) {
+  const u = normalizeArabic(userInput, lenient);
+  if (!u) return false;
+  return u === normalizeArabic(correct, lenient);
+}
+
+// Crop to a centered square and shrink to a small fixed thumbnail before upload.
+function resizeImage(file, size = 200, quality = 0.68) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const side = Math.min(img.width, img.height);
+        const sx = (img.width - side) / 2;
+        const sy = (img.height - side) / 2;
+        const canvas = document.createElement('canvas');
+        canvas.width = size; canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, sx, sy, side, side, 0, 0, size, size);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+// ---------- Speech ----------
+
+let cachedArVoice = null;
+function primeVoices() {
+  if (typeof window === 'undefined' || !window.speechSynthesis) return;
+  const pick = () => {
+    const voices = window.speechSynthesis.getVoices();
+    cachedArVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('ar')) || null;
+  };
+  pick();
+  window.speechSynthesis.onvoiceschanged = pick;
+}
+
+function fallbackSpeak(text) {
+  if (!text || !window.speechSynthesis) return;
+  try {
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ar-SA'; u.rate = 0.85;
+    if (cachedArVoice) u.voice = cachedArVoice;
+    window.speechSynthesis.speak(u);
+  } catch (e) {}
+}
+
+function speak(text) {
+  if (!text) return;
+  try {
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=ar&client=tw-ob`;
+    const audio = new Audio(url);
+    audio.onerror = () => fallbackSpeak(text);
+    const p = audio.play();
+    if (p && p.catch) p.catch(() => fallbackSpeak(text));
+  } catch (e) { fallbackSpeak(text); }
+}
+
+function SpeakButton({ text, className = '' }) {
+  if (!text) return null;
+  return (
+    <button type="button" onClick={(e) => { e.stopPropagation(); speak(text); }}
+      className={`inline-flex items-center justify-center text-amber-500 hover:text-amber-300 ${className}`}
+      aria-label="Play pronunciation" title="Play pronunciation">
+      🔊
+    </button>
+  );
+}
+
+// ---------- Local (per-browser) storage ----------
+
+function useLocalState(key, initialValue) {
+  const [value, setValue] = useState(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : initialValue;
+    } catch (e) { return initialValue; }
+  });
+  const persist = useCallback((v) => {
+    setValue(v);
+    try { localStorage.setItem(key, JSON.stringify(v)); } catch (e) {}
+  }, [key]);
+  return [value, persist];
+}
+
+// ---------- Shared vocab storage (Supabase) ----------
+
+function rowToItem(row) {
+  return {
+    id: row.id,
+    unit: row.unit || '',
+    partOfSpeech: row.part_of_speech || '',
+    english: row.english || '',
+    arabic: row.arabic || '',
+    photo: row.photo || '',
+    photoNote: row.photo_note || '',
+  };
+}
+
+async function fetchVocab() {
+  const { data, error } = await sb.from('vocab_items').select('*').order('created_at', { ascending: true });
+  if (error) { console.error('fetchVocab error', error); return { items: [], ok: false }; }
+  return { items: (data || []).map(rowToItem), ok: true };
+}
+
+async function saveVocabItem(item) {
+  const { error } = await sb.from('vocab_items').upsert({
+    id: item.id,
+    unit: item.unit,
+    part_of_speech: item.partOfSpeech,
+    english: item.english,
+    arabic: item.arabic,
+    photo: item.photo,
+    photo_note: item.photoNote,
+  });
+  if (error) console.error('saveVocabItem error', error);
+  return !error;
+}
+
+async function deleteVocabItem(id) {
+  const { error } = await sb.from('vocab_items').delete().eq('id', id);
+  if (error) console.error('deleteVocabItem error', error);
+  return !error;
+}
+
+function emptyItem(unit = '') {
+  return { id: uid(), unit, partOfSpeech: '', english: '', arabic: '', photo: '', photoNote: '' };
+}
+
+// ============================================================
+// Access gates
+// ============================================================
+
+function ClassGate({ onUnlock }) {
+  const [pw, setPw] = useState('');
+  const [error, setError] = useState('');
+  function submit() {
+    if (pw === CLASS_PASSWORD) onUnlock();
+    else setError('Incorrect password.');
+  }
+  return (
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center px-4">
+      <div className="max-w-sm w-full text-center space-y-5">
+        <div>
+          <h1 className="font-serif text-3xl text-amber-400 tracking-wide">لِسان</h1>
+          <p className="text-stone-500 text-sm tracking-widest uppercase mt-1">Lisān · Arabic drills</p>
+        </div>
+        <div className="bg-slate-900 border border-slate-700 rounded-xl p-5 space-y-3 text-left">
+          <label className="block text-xs uppercase tracking-wider text-stone-400">Class password</label>
+          <input type="password" value={pw}
+            onChange={e => { setPw(e.target.value); setError(''); }}
+            onKeyDown={e => { if (e.key === 'Enter') submit(); }}
+            autoFocus
+            className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-stone-100 focus:outline-none focus:ring-2 focus:ring-amber-500" />
+          {error && <p className="text-sm text-rose-400">{error}</p>}
+          <button onClick={submit} className="w-full bg-amber-500 hover:bg-amber-400 text-slate-900 font-medium rounded-lg py-2">Enter</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AdminControl({ isAdmin, setIsAdmin }) {
+  const [showPrompt, setShowPrompt] = useState(false);
+  const [pw, setPw] = useState('');
+  const [error, setError] = useState('');
+
+  if (isAdmin) {
+    return (
+      <button onClick={() => setIsAdmin(false)}
+        className="text-xs px-2.5 py-1 rounded-full border border-amber-500 text-amber-400 hover:bg-amber-500 hover:text-slate-900 transition">
+        Admin unlocked · tap to lock
+      </button>
+    );
+  }
+  if (showPrompt) {
+    return (
+      <div className="flex items-center gap-1.5">
+        <input type="password" value={pw}
+          onChange={e => { setPw(e.target.value); setError(''); }}
+          onKeyDown={e => {
+            if (e.key === 'Enter') {
+              if (pw === ADMIN_PASSWORD) { setIsAdmin(true); setShowPrompt(false); setPw(''); }
+              else setError('Wrong password');
+            }
+            if (e.key === 'Escape') { setShowPrompt(false); setPw(''); setError(''); }
+          }}
+          autoFocus placeholder="Admin password"
+          className="bg-slate-800 border border-slate-600 rounded-lg px-2 py-1 text-sm text-stone-100 w-32 focus:outline-none focus:ring-2 focus:ring-amber-500" />
+        <button onClick={() => {
+            if (pw === ADMIN_PASSWORD) { setIsAdmin(true); setShowPrompt(false); setPw(''); }
+            else setError('Wrong password');
+          }} className="text-xs px-2 py-1 rounded-lg bg-amber-500 text-slate-900 font-medium">Go</button>
+        {error && <span className="text-xs text-rose-400">{error}</span>}
+      </div>
+    );
+  }
+  return (
+    <button onClick={() => setShowPrompt(true)} className="text-xs px-2.5 py-1 rounded-full border border-slate-600 text-stone-400 hover:border-amber-500 hover:text-amber-400 transition">
+      Admin
+    </button>
+  );
+}
+
+// ============================================================
+// Vocab Form
+// ============================================================
+
+function VocabForm({ initial, onSave, onCancel, existingUnits }) {
+  const [item, setItem] = useState(initial);
+  const [imgBusy, setImgBusy] = useState(false);
+  const [imgError, setImgError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const fileRef = useRef(null);
+
+  async function handleSave() {
+    if (!item.english.trim() || !item.arabic.trim()) return;
+    setSaving(true);
+    await onSave(item);
+    setSaving(false);
+  }
+
+  async function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setImgBusy(true); setImgError('');
+    try {
+      const dataUrl = await resizeImage(file);
+      setItem(prev => ({ ...prev, photo: dataUrl }));
+    } catch (err) {
+      setImgError("Couldn't load that image — try another photo.");
+    } finally {
+      setImgBusy(false);
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  }
+
+  return (
+    <div className="bg-slate-900 border border-slate-700 rounded-xl p-5 space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-serif text-lg text-stone-100 tracking-wide">{initial.english ? 'Edit entry' : 'New entry'}</h3>
+        <button onClick={onCancel} className="text-stone-400 hover:text-stone-200">✕</button>
+      </div>
+
+      <div>
+        <label className="block text-xs uppercase tracking-wider text-stone-400 mb-1">
+          Subject / unit <span className="normal-case text-stone-500">— groups entries for drilling together</span>
+        </label>
+        <input list="unit-suggestions" value={item.unit || ''}
+          onChange={e => setItem(prev => ({ ...prev, unit: e.target.value }))}
+          placeholder="e.g. Greetings"
+          className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-stone-100 focus:outline-none focus:ring-2 focus:ring-amber-500" />
+        <datalist id="unit-suggestions">{existingUnits.map(u => <option key={u} value={u} />)}</datalist>
+      </div>
+
+      <div>
+        <label className="block text-xs uppercase tracking-wider text-stone-400 mb-2">Part of speech</label>
+        <div className="flex flex-wrap gap-2">
+          {PARTS_OF_SPEECH.map(p => (
+            <button key={p} type="button"
+              onClick={() => setItem(prev => ({ ...prev, partOfSpeech: prev.partOfSpeech === p ? '' : p }))}
+              className={`px-3 py-1.5 rounded-full text-sm border transition ${item.partOfSpeech === p ? 'bg-amber-500 border-amber-500 text-slate-900 font-medium' : 'border-slate-600 text-stone-300 hover:border-amber-500'}`}>
+              {p}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <label className="block text-xs uppercase tracking-wider text-stone-400 mb-1">English</label>
+        <input value={item.english}
+          onChange={e => setItem(prev => ({ ...prev, english: e.target.value }))}
+          placeholder='e.g. "She runs" or "big [male]" or "big [female]"'
+          className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-stone-100 focus:outline-none focus:ring-2 focus:ring-amber-500" />
+        <p className="text-xs text-stone-500 mt-1">Use "/" for accepted alternates. Add a bracket tag like [male] or [female] when it matters for the Arabic — shown when translating into Arabic, ignored when checking English answers.</p>
+      </div>
+
+      <div>
+        <label className="block text-xs uppercase tracking-wider text-stone-400 mb-1">Arabic</label>
+        <div className="flex items-center gap-2">
+          <input dir="rtl" lang="ar" value={item.arabic}
+            onChange={e => setItem(prev => ({ ...prev, arabic: e.target.value }))}
+            className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-stone-100 text-xl focus:outline-none focus:ring-2 focus:ring-amber-500"
+            style={{ fontFamily: "'Traditional Arabic','Arial',sans-serif" }} />
+          <SpeakButton text={item.arabic} />
+        </div>
+      </div>
+
+      <div className="border-t border-slate-700 pt-4">
+        <label className="block text-xs uppercase tracking-wider text-stone-400 mb-2">
+          Photo prompt <span className="normal-case text-stone-500">(optional)</span>
+        </label>
+        {item.photo ? (
+          <div className="flex items-start gap-3">
+            <img src={item.photo} alt="" className="w-24 h-24 object-cover rounded-lg border border-slate-600" />
+            <div className="flex-1 space-y-2">
+              <input value={item.photoNote || ''}
+                onChange={e => setItem(prev => ({ ...prev, photoNote: e.target.value }))}
+                placeholder='Context note, e.g. "past tense — he" or "plural"'
+                className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-stone-100 focus:outline-none focus:ring-2 focus:ring-amber-500" />
+              <button type="button" onClick={() => setItem(prev => ({ ...prev, photo: '', photoNote: '' }))} className="text-xs text-rose-400 hover:text-rose-300">Remove photo</button>
+            </div>
+          </div>
+        ) : (
+          <label className="flex items-center gap-2 justify-center border border-dashed border-slate-600 rounded-lg py-4 text-stone-400 hover:border-amber-500 hover:text-amber-400 cursor-pointer text-sm">
+            📷 {imgBusy ? 'Processing…' : 'Add a photo'}
+            <input ref={fileRef} type="file" accept="image/*" onChange={handleFile} className="hidden" disabled={imgBusy} />
+          </label>
+        )}
+        {imgError && <p className="text-xs text-rose-400 mt-1">{imgError}</p>}
+      </div>
+
+      <div className="flex gap-2 pt-2">
+        <button onClick={handleSave} disabled={saving} className="flex-1 bg-amber-500 hover:bg-amber-400 text-slate-900 font-medium rounded-lg py-2 transition disabled:opacity-60">
+          {saving ? 'Saving…' : 'Save entry'}
+        </button>
+        <button onClick={onCancel} className="px-4 rounded-lg border border-slate-600 text-stone-300 hover:border-stone-400">Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Vocab List Screen
+// ============================================================
+
+function VocabScreen({ vocab, onSaveItem, onDeleteItem, isAdmin, onRefresh, refreshing }) {
+  const [editing, setEditing] = useState(null);
+  const [unitFilter, setUnitFilter] = useState('all');
+  const [posFilter, setPosFilter] = useState('all');
+  const [saveError, setSaveError] = useState('');
+
+  async function handleSave(item) {
+    const ok = await onSaveItem(item);
+    if (!ok) { setSaveError("Couldn't save that entry — check your connection and try again."); return; }
+    setSaveError('');
+    setEditing(null);
+  }
+
+  const existingUnits = useMemo(() => {
+    const set = new Set();
+    vocab.forEach(v => { if (v.unit && v.unit.trim()) set.add(v.unit.trim()); });
+    return Array.from(set).sort();
+  }, [vocab]);
+
+  const existingPOS = useMemo(() => {
+    const set = new Set();
+    vocab.forEach(v => set.add(posLabel(v.partOfSpeech)));
+    return Array.from(set).sort();
+  }, [vocab]);
+
+  const filtered = vocab
+    .filter(v => unitFilter === 'all' || unitLabel(v.unit) === unitFilter)
+    .filter(v => posFilter === 'all' || posLabel(v.partOfSpeech) === posFilter);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <h2 className="font-serif text-2xl text-stone-100 tracking-wide">Word list</h2>
+        <div className="flex items-center gap-2">
+          <button onClick={onRefresh} className="text-xs px-2.5 py-1.5 rounded-lg border border-slate-600 text-stone-400 hover:border-amber-500 hover:text-amber-400">
+            {refreshing ? 'Refreshing…' : '↻ Refresh'}
+          </button>
+          {isAdmin && !editing && (
+            <button onClick={() => setEditing(emptyItem(unitFilter !== 'all' ? unitFilter : ''))} className="flex items-center gap-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 font-medium rounded-lg px-3 py-1.5 text-sm">
+              + Add entry
+            </button>
+          )}
+        </div>
+      </div>
+
+      {saveError && <p className="text-sm text-rose-400 bg-rose-950/30 border border-rose-800 rounded-lg px-3 py-2">{saveError}</p>}
+
+      {isAdmin && editing && <VocabForm initial={editing} onSave={handleSave} onCancel={() => setEditing(null)} existingUnits={existingUnits} />}
+
+      {existingUnits.length > 0 && (
+        <div className="flex gap-2 flex-wrap text-sm">
+          <button onClick={() => setUnitFilter('all')} className={`px-3 py-1 rounded-full border ${unitFilter === 'all' ? 'bg-slate-700 border-amber-500 text-amber-400' : 'border-slate-700 text-stone-400 hover:border-slate-500'}`}>All units</button>
+          {existingUnits.map(u => (
+            <button key={u} onClick={() => setUnitFilter(u)} className={`px-3 py-1 rounded-full border ${unitFilter === u ? 'bg-slate-700 border-amber-500 text-amber-400' : 'border-slate-700 text-stone-400 hover:border-slate-500'}`}>{u}</button>
+          ))}
+        </div>
+      )}
+
+      {existingPOS.length > 0 && (
+        <div className="flex gap-2 flex-wrap text-sm">
+          <button onClick={() => setPosFilter('all')} className={`px-3 py-1 rounded-full border ${posFilter === 'all' ? 'bg-slate-700 border-amber-500 text-amber-400' : 'border-slate-700 text-stone-400 hover:border-slate-500'}`}>All parts of speech</button>
+          {existingPOS.map(p => (
+            <button key={p} onClick={() => setPosFilter(p)} className={`px-3 py-1 rounded-full border ${posFilter === p ? 'bg-slate-700 border-amber-500 text-amber-400' : 'border-slate-700 text-stone-400 hover:border-slate-500'}`}>{p}</button>
+          ))}
+        </div>
+      )}
+
+      {filtered.length === 0 && (
+        <p className="text-stone-500 italic py-8 text-center">{vocab.length === 0 ? 'No words yet.' : 'Nothing matches these filters.'}</p>
+      )}
+
+      <div className="space-y-2">
+        {filtered.map(item => (
+          <div key={item.id} className="flex items-center justify-between bg-slate-900 border border-slate-700 rounded-lg px-4 py-3">
+            <div className="flex items-center gap-3 min-w-0">
+              {item.photo && <img src={item.photo} alt="" className="w-12 h-12 object-cover rounded-md border border-slate-600 shrink-0" />}
+              <div className="min-w-0">
+                <div className="text-xs text-stone-500 mb-0.5 uppercase tracking-wider">
+                  {unitLabel(item.unit)}{item.partOfSpeech && <span> · {item.partOfSpeech}</span>}
+                </div>
+                <div className="flex items-baseline gap-3 flex-wrap">
+                  <span className="text-stone-100">{item.english}</span>
+                  <span className="flex items-baseline gap-2">
+                    <span dir="rtl" lang="ar" className="text-lg text-amber-400" style={{ fontFamily: "'Traditional Arabic','Arial',sans-serif" }}>{item.arabic}</span>
+                    <SpeakButton text={item.arabic} />
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              {isAdmin && (
+                <>
+                  <button onClick={() => setEditing(item)} className="p-1.5 text-stone-400 hover:text-amber-400">✎</button>
+                  <button onClick={() => onDeleteItem(item.id)} className="p-1.5 text-stone-400 hover:text-rose-400">🗑</button>
+                </>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Pool + question generation
+// ============================================================
+
+function buildPool(vocab, config) {
+  const units = config.units || {};
+  const parts = config.parts || {};
+  return vocab.filter(item => units[unitLabel(item.unit)] !== false && parts[posLabel(item.partOfSpeech)] !== false);
+}
+
+function generateQuestion(pool, config, avoidId) {
+  if (pool.length === 0) return null;
+  let item; let tries = 0;
+  do { item = pool[Math.floor(Math.random() * pool.length)]; tries++; } while (pool.length > 1 && avoidId && item.id === avoidId && tries < 10);
+
+  let direction = config.direction;
+  if (direction === 'mixed') {
+    const options = ['en-to-ar', 'ar-to-en'];
+    if (item.photo) options.push('picture-to-ar');
+    direction = options[Math.floor(Math.random() * options.length)];
+  } else if (direction === 'picture-to-ar' && !item.photo) {
+    direction = 'en-to-ar';
+  }
+
+  if (direction === 'picture-to-ar') {
+    return { itemId: item.id, prompt: { kind: 'picture', photo: item.photo, note: item.photoNote, sub: unitLabel(item.unit) }, expectedMode: 'ar', expected: item.arabic };
+  }
+  if (direction === 'en-to-ar') {
+    return { itemId: item.id, prompt: { kind: 'label', main: item.english, sub: unitLabel(item.unit) }, expectedMode: 'ar', expected: item.arabic };
+  }
+  return { itemId: item.id, prompt: { kind: 'arabic', main: item.arabic, sub: unitLabel(item.unit) }, expectedMode: 'en', expected: item.english };
+}
+
+// ============================================================
+// Setup
+// ============================================================
+
+function SetupScreen({ vocab, config, setConfig, onStart }) {
+  const availableUnits = useMemo(() => { const set = new Set(); vocab.forEach(v => set.add(unitLabel(v.unit))); return Array.from(set).sort(); }, [vocab]);
+  const availablePOS = useMemo(() => { const set = new Set(); vocab.forEach(v => set.add(posLabel(v.partOfSpeech))); return Array.from(set).sort(); }, [vocab]);
+  const hasAnyPhoto = useMemo(() => vocab.some(v => !!v.photo), [vocab]);
+
+  function toggleUnit(u) { setConfig(prev => ({ ...prev, units: { ...prev.units, [u]: prev.units[u] === false ? true : false } })); }
+  function togglePOS(p) { setConfig(prev => ({ ...prev, parts: { ...prev.parts, [p]: prev.parts[p] === false ? true : false } })); }
+
+  const poolSize = buildPool(vocab, config).length;
+
+  const directionOptions = [
+    { key: 'en-to-ar', label: 'English → Arabic' },
+    { key: 'ar-to-en', label: 'Arabic → English' },
+    { key: 'mixed', label: 'Mixed' },
+  ];
+  if (hasAnyPhoto) directionOptions.splice(1, 0, { key: 'picture-to-ar', label: 'Picture → Arabic' });
+
+  return (
+    <div className="space-y-5">
+      <h2 className="font-serif text-2xl text-stone-100 tracking-wide">Set up a drill</h2>
+      <div className="bg-slate-900 border border-slate-700 rounded-xl p-5 space-y-5">
+        {availableUnits.length > 0 && (
+          <div>
+            <p className="text-xs uppercase tracking-wider text-stone-400 mb-2">Subject / unit</p>
+            <div className="flex flex-wrap gap-2">
+              {availableUnits.map(u => (
+                <button key={u} onClick={() => toggleUnit(u)} className={`px-3 py-1.5 rounded-full text-sm border transition ${config.units[u] !== false ? 'bg-amber-500 border-amber-500 text-slate-900 font-medium' : 'border-slate-600 text-stone-300 hover:border-amber-500'}`}>{u}</button>
+              ))}
+            </div>
+          </div>
+        )}
+        {availablePOS.length > 0 && (
+          <div>
+            <p className="text-xs uppercase tracking-wider text-stone-400 mb-2">Part of speech</p>
+            <div className="flex flex-wrap gap-2">
+              {availablePOS.map(p => (
+                <button key={p} onClick={() => togglePOS(p)} className={`px-3 py-1.5 rounded-full text-sm border transition ${config.parts[p] !== false ? 'bg-amber-500 border-amber-500 text-slate-900 font-medium' : 'border-slate-600 text-stone-300 hover:border-amber-500'}`}>{p}</button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div>
+          <p className="text-xs uppercase tracking-wider text-stone-400 mb-2">Direction</p>
+          <div className="flex flex-wrap gap-2">
+            {directionOptions.map(d => (
+              <button key={d.key} onClick={() => setConfig(prev => ({ ...prev, direction: d.key }))} className={`px-3 py-1.5 rounded-full text-sm border transition ${config.direction === d.key ? 'bg-amber-500 border-amber-500 text-slate-900 font-medium' : 'border-slate-600 text-stone-300 hover:border-amber-500'}`}>{d.label}</button>
+            ))}
+          </div>
+          {config.direction === 'picture-to-ar' && <p className="text-xs text-stone-500 mt-1">Words with a photo show the picture; words without one show the English word instead.</p>}
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className="block text-xs uppercase tracking-wider text-stone-400 mb-1">Duration (minutes)</label>
+            <input type="number" min={1} max={30} value={config.duration} onChange={e => setConfig(prev => ({ ...prev, duration: Math.max(1, Number(e.target.value) || 1) }))} className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-stone-100" />
+          </div>
+          <div>
+            <label className="block text-xs uppercase tracking-wider text-stone-400 mb-1">Correct to pass</label>
+            <input type="number" min={1} max={200} value={config.target} onChange={e => setConfig(prev => ({ ...prev, target: Math.max(1, Number(e.target.value) || 1) }))} className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-stone-100" />
+          </div>
+        </div>
+        <label className="flex items-center gap-2 text-sm text-stone-300">
+          <input type="checkbox" checked={!config.strictMode} onChange={e => setConfig(prev => ({ ...prev, strictMode: !e.target.checked }))} className="accent-amber-500" />
+          Forgive minor spelling (diacritics, alef/ya variants)
+        </label>
+      </div>
+      <button disabled={poolSize === 0} onClick={onStart} className={`w-full flex items-center justify-center gap-2 font-medium rounded-xl py-3 transition ${poolSize === 0 ? 'bg-slate-800 text-stone-600 cursor-not-allowed' : 'bg-amber-500 hover:bg-amber-400 text-slate-900'}`}>
+        ▶ Start drill {poolSize > 0 && `(${poolSize} words)`}
+      </button>
+      {poolSize === 0 && <p className="text-sm text-stone-500 text-center">Nothing matches these filters.</p>}
+    </div>
+  );
+}
+
+// ============================================================
+// Quiz Session
+// ============================================================
+
+function QuizScreen({ vocab, config, onFinish }) {
+  const pool = useMemo(() => buildPool(vocab, config), [vocab, config]);
+  const [question, setQuestion] = useState(() => generateQuestion(pool, config, null));
+  const [input, setInput] = useState('');
+  const [status, setStatus] = useState('running');
+  const [feedback, setFeedback] = useState(null);
+  const [score, setScore] = useState(0);
+  const [attempted, setAttempted] = useState(0);
+  const [missed, setMissed] = useState([]);
+  const [timeLeft, setTimeLeft] = useState(config.duration * 60);
+  const inputRef = useRef(null);
+  const finishedRef = useRef(false);
+
+  useEffect(() => { inputRef.current && inputRef.current.focus(); }, [question, status]);
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          clearInterval(t);
+          if (!finishedRef.current) { finishedRef.current = true; onFinish({ score, attempted, missed, target: config.target }); }
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line
+  }, [score, attempted, missed]);
+
+  function promptSummaryFor(prompt) {
+    if (prompt.kind === 'picture') return prompt.note ? `[photo] ${prompt.note}` : '[photo]';
+    return prompt.main;
+  }
+
+  function submit() {
+    if (status !== 'running') return;
+    const val = input;
+    const correct = question.expectedMode === 'ar' ? checkArabicAnswer(val, question.expected, !config.strictMode) : checkEnglishAnswer(val, question.expected);
+    setAttempted(a => a + 1);
+    if (correct) setScore(s => s + 1);
+    else {
+      setMissed(m => [...m, {
+        promptSummary: promptSummaryFor(question.prompt),
+        promptPhoto: question.prompt.kind === 'picture' ? question.prompt.photo : null,
+        yourAnswer: val || '(blank)',
+        correctAnswer: question.expectedMode === 'ar' ? question.expected : stripTag(question.expected),
+        isArabic: question.expectedMode === 'ar',
+      }]);
+    }
+    setFeedback({ correct, correctAnswer: question.expectedMode === 'ar' ? question.expected : stripTag(question.expected) });
+    setStatus('feedback');
+    setTimeout(() => {
+      setQuestion(generateQuestion(pool, config, question.itemId));
+      setInput(''); setFeedback(null); setStatus('running');
+    }, 700);
+  }
+
+  function endNow() {
+    if (finishedRef.current) return;
+    finishedRef.current = true;
+    onFinish({ score, attempted, missed, target: config.target });
+  }
+
+  const mins = Math.floor(timeLeft / 60);
+  const secs = timeLeft % 60;
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center justify-between text-stone-300">
+        <div className="flex items-center gap-1.5">⏱ <span className={`font-mono text-lg ${timeLeft <= 30 ? 'text-rose-400' : ''}`}>{mins}:{String(secs).padStart(2, '0')}</span></div>
+        <div className="flex items-center gap-1.5">🎯 <span>{score} / {config.target}</span></div>
+        <button onClick={endNow} className="flex items-center gap-1 text-sm text-stone-400 hover:text-rose-400">⏹ End</button>
+      </div>
+      <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+        <div className="h-full bg-amber-500 transition-all" style={{ width: `${Math.min(100, (score / config.target) * 100)}%` }} />
+      </div>
+      <div className={`bg-slate-900 border rounded-xl p-8 text-center space-y-4 transition-colors ${feedback ? (feedback.correct ? 'border-emerald-500' : 'border-rose-500') : 'border-slate-700'}`}>
+        <QuestionPrompt prompt={question.prompt} />
+        {!feedback ? (
+          <input ref={inputRef} dir={question.expectedMode === 'ar' ? 'rtl' : 'ltr'} lang={question.expectedMode === 'ar' ? 'ar' : 'en'}
+            value={input} onChange={e => setInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') submit(); }} autoFocus
+            className={`w-full max-w-md mx-auto bg-slate-800 border border-slate-600 rounded-lg px-4 py-3 text-stone-100 text-center focus:outline-none focus:ring-2 focus:ring-amber-500 ${question.expectedMode === 'ar' ? 'text-2xl' : 'text-lg'}`}
+            style={question.expectedMode === 'ar' ? { fontFamily: "'Traditional Arabic','Arial',sans-serif" } : {}}
+            placeholder={question.expectedMode === 'ar' ? 'اكتب هنا' : 'Type here'} />
+        ) : (
+          <div className={`flex items-center justify-center gap-2 text-lg flex-wrap ${feedback.correct ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {feedback.correct ? '✓' : '✕'}
+            {question.expectedMode === 'ar' ? (
+              <span className="flex items-center gap-2">
+                <span dir="rtl" style={{ fontFamily: "'Traditional Arabic','Arial',sans-serif" }}>{feedback.correctAnswer}</span>
+                <SpeakButton text={feedback.correctAnswer} className={feedback.correct ? 'text-emerald-400 hover:text-emerald-300' : 'text-rose-400 hover:text-rose-300'} />
+              </span>
+            ) : (<span>{feedback.correct ? 'Correct' : feedback.correctAnswer}</span>)}
+          </div>
+        )}
+      </div>
+      {!feedback && <button onClick={submit} className="w-full bg-amber-500 hover:bg-amber-400 text-slate-900 font-medium rounded-xl py-2.5">Check</button>}
+    </div>
+  );
+}
+
+function QuestionPrompt({ prompt }) {
+  if (prompt.kind === 'picture') {
+    return (
+      <div className="space-y-2">
+        <p className="text-xs uppercase tracking-wider text-stone-500">{prompt.sub}</p>
+        <img src={prompt.photo} alt="" className="max-h-56 mx-auto rounded-lg border border-slate-700" />
+        {prompt.note && <p className="text-stone-300 text-base">{prompt.note}</p>}
+      </div>
+    );
+  }
+  if (prompt.kind === 'label') {
+    return (
+      <div>
+        <p className="text-xs uppercase tracking-wider text-stone-500 mb-1">{prompt.sub}</p>
+        <p className="text-2xl text-stone-100 font-serif">{prompt.main}</p>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <p className="text-xs uppercase tracking-wider text-stone-500 mb-1">{prompt.sub}</p>
+      <div className="flex items-center justify-center gap-2">
+        <p dir="rtl" lang="ar" className="text-4xl text-amber-400" style={{ fontFamily: "'Traditional Arabic','Arial',sans-serif" }}>{prompt.main}</p>
+        <SpeakButton text={prompt.main} />
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Results
+// ============================================================
+
+function ResultsScreen({ result, onRetry, onSetup }) {
+  const { score, attempted, missed, target } = result;
+  const passed = score >= target;
+  const accuracy = attempted > 0 ? Math.round((score / attempted) * 100) : 0;
+  return (
+    <div className="space-y-5">
+      <div className={`rounded-xl border p-8 text-center space-y-2 ${passed ? 'border-emerald-500 bg-emerald-950/30' : 'border-rose-500 bg-rose-950/20'}`}>
+        <div className={`inline-flex items-center justify-center w-16 h-16 rounded-full border-2 mb-2 text-2xl ${passed ? 'border-emerald-400 text-emerald-400' : 'border-rose-400 text-rose-400'}`}>{passed ? '✓' : '✕'}</div>
+        <h2 className="font-serif text-2xl text-stone-100 tracking-wide">{passed ? 'Passed' : 'Not yet'}</h2>
+        <p className="text-stone-300">{score} correct of {attempted} attempted · needed {target} to pass</p>
+        <p className="text-stone-500 text-sm">{accuracy}% accuracy</p>
+      </div>
+      <div className="flex gap-2">
+        <button onClick={onRetry} className="flex-1 flex items-center justify-center gap-2 bg-amber-500 hover:bg-amber-400 text-slate-900 font-medium rounded-lg py-2.5">↻ Drill again</button>
+        <button onClick={onSetup} className="flex-1 flex items-center justify-center gap-2 border border-slate-600 text-stone-300 hover:border-amber-500 rounded-lg py-2.5">Change settings</button>
+      </div>
+      {missed.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-xs uppercase tracking-wider text-stone-400">Missed ({missed.length})</p>
+          <div className="space-y-1.5 max-h-96 overflow-y-auto">
+            {missed.map((m, i) => (
+              <div key={i} className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm flex gap-3">
+                {m.promptPhoto && <img src={m.promptPhoto} alt="" className="w-12 h-12 object-cover rounded-md border border-slate-600 shrink-0" />}
+                <div className="min-w-0">
+                  <p className="text-stone-400">{m.promptSummary}</p>
+                  <p className="text-rose-400">You typed: {m.yourAnswer}</p>
+                  <p dir="auto" className="text-emerald-400 flex items-center gap-1.5 flex-wrap" style={{ fontFamily: "'Traditional Arabic','Arial',sans-serif" }}>
+                    Correct: {m.correctAnswer} {m.isArabic && <SpeakButton text={m.correctAnswer} className="text-emerald-400 hover:text-emerald-300" />}
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// History (per-browser)
+// ============================================================
+
+function HistoryScreen({ history }) {
+  return (
+    <div className="space-y-4">
+      <h2 className="font-serif text-2xl text-stone-100 tracking-wide">History</h2>
+      {history.length === 0 && <p className="text-stone-500 italic py-8 text-center">No drills completed yet on this device.</p>}
+      <div className="space-y-2">
+        {[...history].reverse().map((h, i) => (
+          <div key={i} className="flex items-center justify-between bg-slate-900 border border-slate-700 rounded-lg px-4 py-3">
+            <div>
+              <p className="text-stone-100">{h.score} / {h.attempted} correct <span className="text-stone-500">(target {h.target})</span></p>
+              <p className="text-xs text-stone-500">{new Date(h.date).toLocaleString()}</p>
+            </div>
+            <span className={`text-xs font-medium px-2 py-1 rounded-full ${h.passed ? 'bg-emerald-950 text-emerald-400 border border-emerald-700' : 'bg-rose-950 text-rose-400 border border-rose-700'}`}>{h.passed ? 'Passed' : 'Not yet'}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Main App
+// ============================================================
+
+function App() {
+  const [vocab, setVocab] = useState([]);
+  const [vocabLoaded, setVocabLoaded] = useState(false);
+  const [vocabError, setVocabError] = useState('');
+  const [refreshing, setRefreshing] = useState(false);
+  const [history, setHistory] = useLocalState('lisan-history', []);
+  const [access, setAccess] = useLocalState('lisan-access', { classUnlocked: false });
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [screen, setScreen] = useState('vocab');
+  const [config, setConfig] = useState({ units: {}, parts: {}, direction: 'en-to-ar', duration: 5, target: 20, strictMode: false });
+  const [lastResult, setLastResult] = useState(null);
+
+  useEffect(() => { primeVoices(); }, []);
+
+  async function loadVocab() {
+    setRefreshing(true);
+    const { items, ok } = await fetchVocab();
+    if (ok) { setVocab(items); setVocabError(''); }
+    else setVocabError("Couldn't load the shared word list — check your connection.");
+    setVocabLoaded(true);
+    setRefreshing(false);
+  }
+
+  useEffect(() => {
+    if (!access.classUnlocked) return;
+    loadVocab();
+    const poll = setInterval(loadVocab, 20000); // pick up words added from other devices
+    return () => clearInterval(poll);
+    // eslint-disable-next-line
+  }, [access.classUnlocked]);
+
+  async function handleSaveItem(item) {
+    const ok = await saveVocabItem(item);
+    if (ok) setVocab(prev => {
+      const exists = prev.some(v => v.id === item.id);
+      return exists ? prev.map(v => v.id === item.id ? item : v) : [...prev, item];
+    });
+    return ok;
+  }
+
+  async function handleDeleteItem(id) {
+    const ok = await deleteVocabItem(id);
+    if (ok) setVocab(prev => prev.filter(v => v.id !== id));
+  }
+
+  if (!access.classUnlocked) {
+    return <ClassGate onUnlock={() => setAccess({ classUnlocked: true })} />;
+  }
+
+  function startQuiz() { setScreen('quiz'); }
+  function finishQuiz(result) {
+    const passed = result.score >= result.target;
+    setLastResult(result);
+    setHistory([...history, { ...result, passed, date: Date.now() }]);
+    setScreen('results');
+  }
+
+  const tabs = [
+    { key: 'vocab', label: 'Word list' },
+    { key: 'setup', label: 'Drill' },
+    { key: 'history', label: 'History' },
+  ];
+
+  return (
+    <div className="min-h-screen bg-slate-950" style={{ fontFamily: 'ui-sans-serif, system-ui, sans-serif' }}>
+      <div className="max-w-2xl mx-auto px-4 py-6">
+        <header className="mb-6 text-center relative">
+          <div className="absolute right-0 top-0"><AdminControl isAdmin={isAdmin} setIsAdmin={setIsAdmin} /></div>
+          <h1 className="font-serif text-3xl text-amber-400 tracking-wide">لِسان</h1>
+          <p className="text-stone-500 text-sm tracking-widest uppercase mt-1">Lisān · Arabic drills</p>
+          <div className="text-amber-600 text-xs mt-2 tracking-[0.3em]">◆ ◇ ◆</div>
+        </header>
+
+        {vocabError && <p className="text-sm text-rose-400 bg-rose-950/30 border border-rose-800 rounded-lg px-3 py-2 mb-4">{vocabError}</p>}
+
+        {screen !== 'quiz' && screen !== 'results' && (
+          <nav className="flex justify-center gap-1 mb-6 bg-slate-900 border border-slate-800 rounded-xl p-1">
+            {tabs.map(t => (
+              <button key={t.key} onClick={() => setScreen(t.key)} className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm transition ${screen === t.key ? 'bg-amber-500 text-slate-900 font-medium' : 'text-stone-400 hover:text-stone-200'}`}>
+                {t.label}
+              </button>
+            ))}
+          </nav>
+        )}
+
+        {!vocabLoaded ? (
+          <p className="text-stone-500 text-center py-12">Loading…</p>
+        ) : (
+          <>
+            {screen === 'vocab' && <VocabScreen vocab={vocab} onSaveItem={handleSaveItem} onDeleteItem={handleDeleteItem} isAdmin={isAdmin} onRefresh={loadVocab} refreshing={refreshing} />}
+            {screen === 'setup' && <SetupScreen vocab={vocab} config={config} setConfig={setConfig} onStart={startQuiz} />}
+            {screen === 'quiz' && <QuizScreen vocab={vocab} config={config} onFinish={finishQuiz} />}
+            {screen === 'results' && lastResult && <ResultsScreen result={lastResult} onRetry={() => setScreen('quiz')} onSetup={() => setScreen('setup')} />}
+            {screen === 'history' && <HistoryScreen history={history} />}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+
+</body>
+</html>
