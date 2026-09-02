@@ -269,9 +269,39 @@
     // --- secondary actions ---
     var acts = el("div", "display:flex;flex-wrap:wrap;gap:10px;justify-content:center");
 
-    var dl = el("a", GHOST + ";text-decoration:none;display:inline-block", "Download for offline");
-    dl.href = review.url;
-    dl.setAttribute("download", "lisan-" + (review.lesson || "review").replace(/\W+/g, "-") + ".mp3");
+    // iOS Safari ignores the download attribute on cross-origin links and
+    // navigates to the file instead, which tears down this overlay. Pulling
+    // the bytes in first and saving from a blob URL keeps us on the page.
+    var dl = el("button", GHOST, "Download for offline");
+    dl.onclick = function () {
+      var label = dl.textContent;
+      dl.disabled = true;
+      dl.textContent = "Preparing…";
+      fetch(review.url)
+        .then(function (r) {
+          if (!r.ok) throw new Error("fetch failed");
+          return r.blob();
+        })
+        .then(function (blob) {
+          var u = URL.createObjectURL(blob);
+          var a = document.createElement("a");
+          a.href = u;
+          a.download = "lisan-" +
+            String(review.lesson || "review").replace(/\W+/g, "-").toLowerCase() + ".mp3";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(function () { URL.revokeObjectURL(u); }, 60000);
+          dl.disabled = false;
+          dl.textContent = "Saved — check Files";
+          setTimeout(function () { dl.textContent = label; }, 4000);
+        })
+        .catch(function () {
+          dl.disabled = false;
+          dl.textContent = "Download failed — try again";
+          setTimeout(function () { dl.textContent = label; }, 4000);
+        });
+    };
     acts.appendChild(dl);
 
     var again = el("button", GHOST, "Pick another lesson");
